@@ -1,0 +1,16 @@
+node_modules/
+dist/
+out/
+coverage/
+*.zip
+*.exe
+*.log
+.env
+.env.*
+!.env.example
+queue.json
+queue.json.tmp
+test-results/
+playwright-report/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+{
+  "name": "vimm-queue",
+  "productName": "Vimm Queue",
+  "version": "1.2.1",
+  "description": "A sequential download queue for Vimm's Lair",
+  "main": "main.js",
+  "author": "Local user",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/*.test.js"
+  },
+  "devDependencies": {
+    "electron": "44.4.5"
+  }
+}
