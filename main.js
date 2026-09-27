@@ -5,7 +5,9 @@ const {pathToFileURL} = require('node:url');
 const {addURLs, addInput, recover, retryAfter} = require('./queue');
 const inspectPage = require('./page');
 const inspectListing = require('./listing');
+const {planRetry,relevantResponse}=require('./retry');
 const TEST = process.env.VIMM_QUEUE_TEST === '1' && !app.isPackaged;
+const TEST_ORIGIN=TEST && /^http:\/\/127\.0\.0\.1:\d+$/.test(process.env.VIMM_QUEUE_TEST_ORIGIN||'') ? process.env.VIMM_QUEUE_TEST_ORIGIN : null;
 if (TEST) app.setPath('userData', process.env.VIMM_QUEUE_TEST_DATA);
 let ui, browser, active, download, timer, inspecting = false, quitting = false, store;
 let listing, listWindow, listNextAt=0;
@@ -42,7 +44,7 @@ async function tickListing() {
   for(const game of state.queue)if(!known.has(game.url) && titles.has(game.url))game.title=titles.get(game.url)||game.title;
   finishListing('complete',`${r.added} games added · ${r.duplicates} duplicates skipped`);
 }
-const trusted = raw => { try { const u=new URL(raw); return u.protocol==='https:' && (u.hostname==='vimm.net' || u.hostname.endsWith('.vimm.net')); } catch {return false;} };
+const trusted = raw => { try { const u=new URL(raw); return (TEST_ORIGIN && u.origin===TEST_ORIGIN) || (u.protocol==='https:' && (u.hostname==='vimm.net' || u.hostname.endsWith('.vimm.net'))); } catch {return false;} };
 function emit() { if (ui && !ui.isDestroyed()) ui.webContents.send('state', state); }
 function save() {
   try { fs.writeFileSync(store+'.tmp', JSON.stringify(state, null, 2)); fs.renameSync(store+'.tmp', store); }
@@ -55,6 +57,18 @@ function fail(message) {
   active=null; download=null; state.running=false; state.notice=message; stopBrowser(); save();
 }
 function hold(message) { state.running=false; state.notice=message; if(active) active.message=message; save(); }
+function scheduleRetry(reason,header) {
+  if(!active || download)return;
+  const job=active, plan=planRetry(job.retryCount,header);
+  if(plan.exhausted) {
+    state.blockedUntil=Math.max(state.blockedUntil,plan.blockedUntil);
+    fail(`${reason} Automatic retries stopped after four retries. Try again later.`);return;
+  }
+  job.retryCount=plan.count;job.retryAt=plan.retryAt;job.status='retrying';job.clicked=false;
+  job.message=`${reason} Retry ${plan.count}/4 at ${new Date(plan.retryAt).toLocaleTimeString()}.`;
+  state.blockedUntil=Math.max(state.blockedUntil,plan.retryAt);state.notice=job.message;
+  active=null;stopBrowser();save();
+}
 function safeName(value) {
   let name=path.basename(value.replace(/\\/g,'/')).replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').replace(/[. ]+$/,'').slice(0,180);
   if (!name || /^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i.test(name)) name='game-'+name;
@@ -95,26 +109,27 @@ async function tick() {
     if(!active && (listing || state.listings.some(x=>x.status==='queued'))) {await tickListing();return;}
     if(active) {
       if(!browser || browser.isDestroyed()) {if(!download) fail('Game window closed. Queue paused.'); return;}
-      if(download || !state.running || active.clicked || browser.webContents.isLoadingMainFrame()) return;
+      if(download || !state.running || browser.webContents.isLoadingMainFrame()) return;
       const job=active;
       const result=await browser.webContents.executeJavaScript(`(${inspectPage.toString()})(false)`);
-      if(active!==job) return;
-      if(result.title) job.title=result.title.replace(/^Vimm.s Lair:\s*/i,'');
+      if(active!==job || download || !state.running) return;
+      if(result.title && !['overload','limit'].includes(result.kind) && !job.clicked) job.title=result.title.replace(/^Vimm.s Lair:\s*/i,'');
       job.status='waiting';
-      if(result.kind==='limit') {state.blockedUntil=Math.max(state.blockedUntil,Date.now()+300000); hold('Vimm reports a download limit. Wait at least five minutes, then resume.'); return;}
+      if(result.kind==='overload' || result.kind==='limit') {scheduleRetry(result.kind==='overload'?'Vimm reports that the server is overloaded.':'Vimm reports a download limit.');return;}
       if(result.kind==='unavailable') {fail('This game is unavailable for download. Remove it or retry later.'); return;}
-      if(result.kind==='ready') {
+      if(result.kind==='ready' && !job.clicked) {
         job.clicked=true; job.message='Waiting for the download to begin. If needed, use Show game page.'; save();
         await browser.webContents.executeJavaScript(`(${inspectPage.toString()})(true)`, true);
       } else {
-        const msg=result.kind==='challenge' ? 'Complete the human check in the game window; the queue will continue.' : 'Waiting for a Download button. Use Show game page to select a format or start manually.';
+        const msg=result.kind==='challenge' ? 'Complete the human check in the game window; the queue will continue.' : job.clicked ? 'Download requested. Waiting for the server; use Show game page for any prompt.' : 'Waiting for a Download button. Use Show game page to select a format or start manually.';
         if(job.message!==msg) {job.message=msg; save();}
       }
       return;
     }
     if(!state.running || Date.now()<Math.max(state.nextAt,state.blockedUntil)) return;
-    const job=state.queue.find(x=>x.status==='queued');
+    const job=state.queue.find(x=>x.status==='retrying') || state.queue.find(x=>x.status==='queued');
     if(!job) {state.running=false; state.notice='Queue finished.'; save(); return;}
+    if(job.retryAt && Date.now()<job.retryAt)return;
     active=job; job.status='opening'; job.clicked=false; job.message='Opening game page'; save();
     browser=new BrowserWindow({show:!TEST,width:1050,height:800,title:'Vimm Queue — game page',autoHideMenuBar:true,webPreferences:{partition:'persist:vimm',nodeIntegration:false,contextIsolation:true,sandbox:true}});
     browser.webContents.setWindowOpenHandler(()=>({action:'deny'}));
@@ -139,14 +154,15 @@ else {
     ses.setPermissionRequestHandler((_wc,_permission,callback)=>callback(false));
     ses.setPermissionCheckHandler(()=>false);
     ses.on('will-download',acceptDownload);
-    ses.webRequest.onHeadersReceived({urls:['https://vimm.net/*','https://*.vimm.net/*']},(details,callback)=>{
+    ses.webRequest.onHeadersReceived({urls:['https://vimm.net/*','https://*.vimm.net/*',...(TEST_ORIGIN?[TEST_ORIGIN+'/*']:[])]},(details,callback)=>{
       callback({cancel:false});
-      if((!active && !listing) || ![429,503].includes(details.statusCode)) return;
+      const gameResponse=active && !download && browser && relevantResponse(details,browser.webContents.id,active.clicked);
+      const listResponse=listing && listWindow && relevantResponse(details,listWindow.webContents.id,false);
+      if(!gameResponse && !listResponse) return;
       const headers=details.responseHeaders || {};
       const key=Object.keys(headers).find(k=>k.toLowerCase()==='retry-after');
-      state.blockedUntil=Math.max(state.blockedUntil,retryAfter(headers[key]?.[0]));
-      if(listing){finishListing('failed',`Server returned ${details.statusCode}. Retry after ${new Date(state.blockedUntil).toLocaleTimeString()}.`);return;}
-      hold(`Server returned ${details.statusCode}. Queue paused until at least ${new Date(state.blockedUntil).toLocaleTimeString()}.`);
+      if(listResponse){state.blockedUntil=Math.max(state.blockedUntil,retryAfter(headers[key]?.[0]));finishListing('failed',`Server returned ${details.statusCode}. Retry after ${new Date(state.blockedUntil).toLocaleTimeString()}.`);return;}
+      scheduleRetry(`Download server returned HTTP ${details.statusCode}.`,headers[key]?.[0]);
     });
     ui=new BrowserWindow({show:!TEST,width:1120,height:820,minWidth:800,minHeight:600,backgroundColor:'#10151c',autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.js'),nodeIntegration:false,contextIsolation:true,sandbox:true}});
     ui.webContents.setWindowOpenHandler(({url})=>{
@@ -166,12 +182,11 @@ else {
         case 'listingRemove': if(listing?.id===data)finishListing('failed','Import cancelled.');state.listings=state.listings.filter(x=>x.id!==data);break;
         case 'listingRetry': {const job=state.listings.find(x=>x.id===data);if(job?.status==='failed'){job.status='queued';job.message='Waiting to read listing';}break;}
         case 'start':
-          if(Date.now()<state.blockedUntil)throw Error('Server cooldown is still active.');
           fs.mkdirSync(state.folder,{recursive:true}); fs.accessSync(state.folder,fs.constants.W_OK);
-          state.running=true; state.notice='Queue running — one download at a time.'; break;
+          state.running=true; state.notice=Date.now()<state.blockedUntil?'Queue will continue after the server cooldown.':'Queue running — one download at a time.'; break;
         case 'pause': state.running=false; state.notice='Paused. An active download will finish; the next will wait.'; break;
-        case 'cancel': if(download)download.cancel(); else if(active)fail('Cancelled. Queue paused.'); break;
-        case 'retry': {const job=state.queue.find(x=>x.id===data); if(job?.status==='failed'){job.status='queued';job.message='';job.received=0;job.total=0;job.clicked=false;} break;}
+        case 'cancel': if(download)download.cancel(); else if(active)fail('Cancelled. Queue paused.');else {const job=state.queue.find(x=>x.status==='retrying');if(job){job.status='failed';job.message='Automatic retry cancelled.';state.running=false;state.notice='Automatic retry cancelled. Queue paused.';}} break;
+        case 'retry': {const job=state.queue.find(x=>x.id===data); if(job?.status==='failed'){job.status='queued';job.message='';job.received=0;job.total=0;job.clicked=false;job.retryCount=0;job.retryAt=0;} break;}
         case 'remove': state.queue=state.queue.filter(x=>x.id!==data || x===active); break;
         case 'clear': state.queue=state.queue.filter(x=>x.status!=='complete'); break;
         case 'folder': if(active)throw Error('Pause and finish or cancel the active item before changing folder.'); {const pick=await dialog.showOpenDialog(ui,{properties:['openDirectory','createDirectory'],defaultPath:state.folder}); if(!pick.canceled)state.folder=pick.filePaths[0];} break;

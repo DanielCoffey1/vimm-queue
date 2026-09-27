@@ -20,13 +20,13 @@ function render(state) {
   }
   $('listings').replaceChildren(imports);
   if(document.activeElement!==$('delay'))$('delay').value=state.delay;
-  const active=state.queue.find(x=>['opening','waiting','downloading'].includes(x.status));
+  const active=state.queue.find(x=>['opening','waiting','downloading','retrying'].includes(x.status));
   $('count').textContent=state.queue.length;
-  $('summary').textContent=`${state.queue.filter(x=>x.status==='queued').length} queued · ${state.queue.filter(x=>x.status==='complete').length} completed · ${state.queue.filter(x=>x.status==='failed').length} need attention`;
-  $('start').disabled=state.running || Date.now()<state.blockedUntil;
+  $('summary').textContent=`${state.queue.filter(x=>x.status==='queued').length} queued · ${state.queue.filter(x=>x.status==='retrying').length} waiting to retry · ${state.queue.filter(x=>x.status==='complete').length} completed · ${state.queue.filter(x=>x.status==='failed').length} need attention`;
+  $('start').disabled=state.running;
   $('start').textContent=active?'▶ Resume queue':'▶ Start queue';
-  $('pause').disabled=!state.running; $('cancel').disabled=!active; $('show').disabled=!active;
-  let notice=active?.message || state.notice;
+  $('pause').disabled=!state.running; $('cancel').disabled=!active; $('show').disabled=!active || active.status==='retrying';
+  let notice=!state.running ? state.notice : active?.message || state.notice;
   const wait=Math.ceil((Math.max(state.nextAt,state.blockedUntil)-Date.now())/1000);
   if(wait>0)notice+=` Waiting ${wait}s.`;
   $('notice').textContent=notice;
